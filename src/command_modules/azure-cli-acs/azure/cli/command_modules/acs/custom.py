@@ -38,10 +38,12 @@ from azure.cli.command_modules.acs import acs_client, proxy
 from azure.cli.command_modules.acs._params import regions_in_preview, regions_in_prod
 from azure.cli.core.api import get_config_dir
 from azure.cli.core._profile import Profile
+from azure.cli.core.commands import LongRunningOperation
 from azure.cli.core.commands.client_factory import get_mgmt_service_client
 from azure.cli.core.keys import is_valid_ssh_rsa_public_key
 from azure.cli.core.util import in_cloud_console, shell_safe_json_parse, truncate_text, sdk_no_wait
 from azure.graphrbac.models import (ApplicationCreateParameters,
+                                    ApplicationUpdateParameters,
                                     PasswordCredential,
                                     KeyCredential,
                                     ServicePrincipalCreateParameters,
@@ -1785,7 +1787,7 @@ def aks_use_dev_spaces(cmd, client, name, resource_group_name, update=False, spa
     :type prompt: bool
     """
 
-    if _get_or_add_extension(DEV_SPACES_EXTENSION_NAME, DEV_SPACES_EXTENSION_MODULE, update):
+    if _get_or_add_extension(cmd, DEV_SPACES_EXTENSION_NAME, DEV_SPACES_EXTENSION_MODULE, update):
         azext_custom = _get_azext_module(DEV_SPACES_EXTENSION_NAME, DEV_SPACES_EXTENSION_MODULE)
         try:
             azext_custom.ads_use_dev_spaces(name, resource_group_name, update, space_name, prompt)
@@ -1808,7 +1810,7 @@ def aks_remove_dev_spaces(cmd, client, name, resource_group_name, prompt=False):
     :type prompt: bool
     """
 
-    if _get_or_add_extension(DEV_SPACES_EXTENSION_NAME, DEV_SPACES_EXTENSION_MODULE):
+    if _get_or_add_extension(cmd, DEV_SPACES_EXTENSION_NAME, DEV_SPACES_EXTENSION_MODULE):
         azext_custom = _get_azext_module(DEV_SPACES_EXTENSION_NAME, DEV_SPACES_EXTENSION_MODULE)
         try:
             azext_custom.ads_remove_dev_spaces(name, resource_group_name, prompt)
@@ -1924,20 +1926,20 @@ def _handle_addons_args(cmd, addons_str, subscription_id, resource_group_name, a
     return addon_profiles
 
 
-def _install_dev_spaces_extension(extension_name):
+def _install_dev_spaces_extension(cmd, extension_name):
     try:
         from azure.cli.core.extension import operations
-        operations.add_extension(extension_name=extension_name)
+        operations.add_extension(cmd=cmd, extension_name=extension_name)
     except Exception:  # nopa pylint: disable=broad-except
         return False
     return True
 
 
-def _update_dev_spaces_extension(extension_name, extension_module):
+def _update_dev_spaces_extension(cmd, extension_name, extension_module):
     from azure.cli.core.extension import ExtensionNotInstalledException
     try:
         from azure.cli.core.extension import operations
-        operations.update_extension(extension_name=extension_name)
+        operations.update_extension(cmd=cmd, extension_name=extension_name)
         operations.reload_extension(extension_name=extension_name)
     except CLIError as err:
         logger.info(err)
@@ -1951,14 +1953,14 @@ def _update_dev_spaces_extension(extension_name, extension_module):
     return True
 
 
-def _get_or_add_extension(extension_name, extension_module, update=False):
+def _get_or_add_extension(cmd, extension_name, extension_module, update=False):
     from azure.cli.core.extension import (ExtensionNotInstalledException, get_extension)
     try:
         get_extension(extension_name)
         if update:
-            return _update_dev_spaces_extension(extension_name, extension_module)
+            return _update_dev_spaces_extension(cmd, extension_name, extension_module)
     except ExtensionNotInstalledException:
-        return _install_dev_spaces_extension(extension_name)
+        return _install_dev_spaces_extension(cmd, extension_name)
     return True
 
 
@@ -2257,11 +2259,10 @@ def _ensure_osa_aad(cli_ctx,
         # Read directory permissions on Windows Azure Active Directory API
         directory_access = ResourceAccess(id="5778995a-e1bf-45b8-affa-663a9f3f4d04",
                                          additional_properties=None, type="Role")
-        
+
         required_osa_aad_access = RequiredResourceAccess(resource_access=[resource_access, directory_access],
                                                          additional_properties=None,
                                                          resource_app_id="00000002-0000-0000-c000-000000000000")
-        
         list_aad_filtered = list(rbac_client.applications.list(filter="identifierUris/any(s:s eq '{}')"
                                                                .format(reply_url)))
         if update:
@@ -2300,6 +2301,14 @@ def _ensure_osa_aad(cli_ctx,
         kind='AADIdentityProvider',
         customer_admin_group_id=customer_admin_group_id)
 
+
+def _patch_osa_aad(cli_ctx, osamc):
+    rbac_client = get_graph_rbac_management_client(cli_ctx)
+    aad_client_app_id = osamc.auth_profile.identity_providers[0].provider.client_id
+    result = list(rbac_client.applications.list(filter="appId eq '{}'".format(aad_client_app_id)))
+    reply_url = 'https://{}/oauth2callback/Azure%20AD'.format(osamc.public_hostname)
+    params = ApplicationUpdateParameters(reply_urls=[reply_url])
+    rbac_client.applications.patch(result[0].object_id, params)
 
 def _ensure_service_principal(cli_ctx,
                               service_principal=None,
@@ -2479,7 +2488,6 @@ def osa_list(cmd, client, resource_group_name=None):
 
 
 def openshift_create(cmd, client, resource_group_name, name,  # pylint: disable=too-many-locals
-                     fqdn,
                      location=None,
                      compute_vm_size="Standard_D4s_v3",
                      compute_count=3,
@@ -2535,7 +2543,7 @@ def openshift_create(cmd, client, resource_group_name, name,  # pylint: disable=
     osa_aad_identity = _ensure_osa_aad(cmd.cli_ctx,
                                        aad_client_app_id=aad_client_app_id,
                                        aad_client_app_secret=aad_client_app_secret,
-                                       aad_tenant_id=aad_tenant_id, identifier=fqdn,
+                                       aad_tenant_id=aad_tenant_id, identifier="OS_{}_{}_{}".format(resource_group_name, name, location),
                                        name=name, update=update_aad_secret,
                                        customer_admin_group_id=customer_admin_group_id)
     identity_providers.append(
@@ -2564,20 +2572,21 @@ def openshift_create(cmd, client, resource_group_name, name,  # pylint: disable=
     osamc = OpenShiftManagedCluster(
         location=location, tags=tags,
         open_shift_version="v3.11",
-        fqdn=fqdn,
+        fqdn="{}.{}.cloudapp.azure.com".format(''.join(random.choices(string.ascii_lowercase, k=20)), location),
         network_profile=network_profile,
         auth_profile=auth_profile,
         agent_pool_profiles=agent_pool_profiles,
         master_pool_profile=agent_master_pool_profile,
         router_profiles=[default_router_profile])
 
-    try:
-        # long_running_operation_timeout=300
-        return sdk_no_wait(no_wait, client.create_or_update,
-                           resource_group_name=resource_group_name, resource_name=name, parameters=osamc)
-    except CloudError as ex:
-        raise ex
+    result = sdk_no_wait(no_wait, client.create_or_update,
+                         resource_group_name=resource_group_name, resource_name=name, parameters=osamc)
 
+    result = LongRunningOperation(cmd.cli_ctx)(result)
+
+    _patch_osa_aad(cmd.cli_ctx, result)
+
+    return result
 
 def openshift_show(cmd, client, resource_group_name, name):
     mc = client.get(resource_group_name, name)
